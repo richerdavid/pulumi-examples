@@ -13,16 +13,10 @@ import * as path from "path";
 const stackConfig = new pulumi.Config("static-website");
 
 const config = {
-    // pathToWebsiteContents is a relativepath to the website's contents.
-    pathToWebsiteContents: stackConfig.require("pathToWebsiteContents"),
     // targetDomain is the domain/host to serve content at.
     targetDomain: stackConfig.require("targetDomain"),
     // (Optional) ACM certificate ARN for the target domain; must be in the us-east-1 region. If omitted, an ACM certificate will be created.
     certificateArn: stackConfig.get("certificateArn"),
-    // If true create an A record for the www subdomain of targetDomain pointing to the generated cloudfront distribution.
-    // If a certificate was generated it will support this subdomain.
-    // default: true
-    includeWWW: stackConfig.getBoolean("includeWWW") ?? true,
 };
 
 // contentBucket is the S3 bucket that the website's contents will be stored in.
@@ -35,44 +29,6 @@ const contentBucket = new aws.s3.Bucket("contentBucket",
             indexDocument: "index.html",
             errorDocument: "404.html",
         },
-    });
-
-// crawlDirectory recursive crawls the provided directory, applying the provided function
-// to every file it contains. Doesn't handle cycles from symlinks.
-function crawlDirectory(dir: string, f: (_: string) => void) {
-    const files = fs.readdirSync(dir);
-    for (const file of files) {
-        const filePath = `${dir}/${file}`;
-        const stat = fs.statSync(filePath);
-        if (stat.isDirectory()) {
-            crawlDirectory(filePath, f);
-        }
-        if (stat.isFile()) {
-            f(filePath);
-        }
-    }
-}
-
-// Sync the contents of the source directory with the S3 bucket, which will in-turn show up on the CDN.
-const webContentsRootPath = path.join(process.cwd(), config.pathToWebsiteContents);
-console.log("Syncing contents from local disk at", webContentsRootPath);
-crawlDirectory(
-    webContentsRootPath,
-    (filePath: string) => {
-        const relativeFilePath = filePath.replace(webContentsRootPath + "/", "");
-        const contentFile = new aws.s3.BucketObject(
-            relativeFilePath,
-            {
-                key: relativeFilePath,
-
-                acl: "public-read",
-                bucket: contentBucket,
-                contentType: mime.getType(filePath) || undefined,
-                source: new pulumi.asset.FileAsset(filePath),
-            },
-            {
-                parent: contentBucket,
-            });
     });
 
 // logsBucket is an S3 bucket that will contain the CDN's request logs.
@@ -96,11 +52,9 @@ if (config.certificateArn === undefined) {
         region: "us-east-1", // Per AWS, ACM certificate must be in the us-east-1 region.
     });
 
-    // if config.includeWWW include required subjectAlternativeNames to support the www subdomain
     const certificateConfig: aws.acm.CertificateArgs = {
         domainName: config.targetDomain,
-        validationMethod: "DNS",
-        subjectAlternativeNames: config.includeWWW ? [`www.${config.targetDomain}`] : [],
+        validationMethod: "DNS"
     };
 
     const certificate = new aws.acm.Certificate("certificate", certificateConfig, { provider: eastRegion });
@@ -120,22 +74,6 @@ if (config.certificateArn === undefined) {
         ttl: tenMinutes,
     });
 
-    // if config.includeWWW ensure we validate the www subdomain as well
-    let subdomainCertificateValidationDomain;
-    if (config.includeWWW) {
-        subdomainCertificateValidationDomain = new aws.route53.Record(`${config.targetDomain}-validation2`, {
-            name: certificate.domainValidationOptions[1].resourceRecordName,
-            zoneId: hostedZoneId,
-            type: certificate.domainValidationOptions[1].resourceRecordType,
-            records: [certificate.domainValidationOptions[1].resourceRecordValue],
-            ttl: tenMinutes,
-        });
-    }
-
-    // if config.includeWWW include the validation record for the www subdomain
-    const validationRecordFqdns = subdomainCertificateValidationDomain === undefined ?
-        [certificateValidationDomain.fqdn] : [certificateValidationDomain.fqdn, subdomainCertificateValidationDomain.fqdn];
-
     /**
      * This is a _special_ resource that waits for ACM to complete validation via the DNS record
      * checking for a status of "ISSUED" on the certificate itself. No actual resources are
@@ -147,7 +85,7 @@ if (config.certificateArn === undefined) {
      */
     const certificateValidation = new aws.acm.CertificateValidation("certificateValidation", {
         certificateArn: certificate.arn,
-        validationRecordFqdns: validationRecordFqdns,
+        validationRecordFqdns: [certificateValidationDomain.fqdn],
     }, { provider: eastRegion });
 
     certificateArn = certificateValidation.certificateArn;
@@ -158,9 +96,6 @@ const originAccessIdentity = new aws.cloudfront.OriginAccessIdentity("originAcce
   comment: "this is needed to setup s3 polices and make s3 not public.",
 });
 
-// if config.includeWWW include an alias for the www subdomain
-const distributionAliases = config.includeWWW ? [config.targetDomain, `www.${config.targetDomain}`] : [config.targetDomain];
-
 // distributionArgs configures the CloudFront distribution. Relevant documentation:
 // https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/distribution-web-values-specify.html
 // https://www.terraform.io/docs/providers/aws/r/cloudfront_distribution.html
@@ -168,7 +103,7 @@ const distributionArgs: aws.cloudfront.DistributionArgs = {
     enabled: true,
     // Alternate aliases the CloudFront distribution can be reached at, in addition to https://xxxx.cloudfront.net.
     // Required if you want to access the distribution via config.targetDomain as well.
-    aliases: distributionAliases,
+    aliases: [config.targetDomain],
 
     // We only specify one origin for this distribution, the S3 content bucket.
     origins: [
@@ -274,27 +209,6 @@ function createAliasRecord(
         });
 }
 
-function createWWWAliasRecord(targetDomain: string, distribution: aws.cloudfront.Distribution): aws.route53.Record {
-    const domainParts = getDomainAndSubdomain(targetDomain);
-    const hostedZoneId = aws.route53.getZone({ name: domainParts.parentDomain }, { async: true }).then(zone => zone.zoneId);
-
-    return new aws.route53.Record(
-        `${targetDomain}-www-alias`,
-        {
-            name: `www.${targetDomain}`,
-            zoneId: hostedZoneId,
-            type: "A",
-            aliases: [
-                {
-                    name: distribution.domainName,
-                    zoneId: distribution.hostedZoneId,
-                    evaluateTargetHealth: true,
-                },
-            ],
-        },
-    );
-}
-
 const bucketPolicy = new aws.s3.BucketPolicy("bucketPolicy", {
     bucket: contentBucket.id, // refer to the bucket created earlier
     policy: pulumi.all([originAccessIdentity.iamArn, contentBucket.arn]).apply(([oaiArn, bucketArn]) =>JSON.stringify({
@@ -313,9 +227,6 @@ const bucketPolicy = new aws.s3.BucketPolicy("bucketPolicy", {
 });
 
 const aRecord = createAliasRecord(config.targetDomain, cdn);
-if (config.includeWWW) {
-    const cnameRecord = createWWWAliasRecord(config.targetDomain, cdn);
-}
 
 // Export properties from this stack. This prints them at the end of `pulumi up` and
 // makes them easier to access from the pulumi.com.
